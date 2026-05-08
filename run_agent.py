@@ -1927,6 +1927,7 @@ class AIAgent:
         self._session_messages: List[Dict[str, Any]] = []
         self._memory_write_origin = "assistant_tool"
         self._memory_write_context = "foreground"
+        self._cron_safe_memory = False
         
         # Cached system prompt -- built once per session, only rebuilt on compression
         self._cached_system_prompt: Optional[str] = None
@@ -10656,21 +10657,40 @@ class AIAgent:
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
+            action = function_args.get("action")
+            content = function_args.get("content")
+            cron_safe = bool(getattr(self, "_cron_safe_memory", False))
             from tools.memory_tool import memory_tool as _memory_tool
             result = _memory_tool(
-                action=function_args.get("action"),
+                action=action,
                 target=target,
-                content=function_args.get("content"),
+                content=content,
                 old_text=function_args.get("old_text"),
                 store=self._memory_store,
+                cron_safe=cron_safe,
             )
+            if cron_safe:
+                try:
+                    parsed = json.loads(result)
+                    from cron.scheduler import _audit_cron_memory_write
+                    _audit_cron_memory_write(
+                        job_id=(self.session_id or "").split("_")[1] if (self.session_id or "").startswith("cron_") else "",
+                        session_id=self.session_id or "",
+                        action=str(action or ""),
+                        target=str(target or ""),
+                        success=bool(parsed.get("success")),
+                        content_length=len(content or ""),
+                        error=parsed.get("error"),
+                    )
+                except Exception:
+                    pass
             # Bridge: notify external memory provider of built-in memory writes
-            if self._memory_manager and function_args.get("action") in {"add", "replace"}:
+            if (not cron_safe) and self._memory_manager and action in {"add", "replace"}:
                 try:
                     self._memory_manager.on_memory_write(
-                        function_args.get("action", ""),
+                        action or "",
                         target,
-                        function_args.get("content", ""),
+                        content or "",
                         metadata=self._build_memory_write_metadata(
                             task_id=effective_task_id,
                             tool_call_id=tool_call_id,
@@ -11295,21 +11315,40 @@ class AIAgent:
                     self._vprint(f"  {_get_cute_tool_message_impl('session_search', function_args, tool_duration, result=function_result)}")
             elif function_name == "memory":
                 target = function_args.get("target", "memory")
+                action = function_args.get("action")
+                content = function_args.get("content")
+                cron_safe = bool(getattr(self, "_cron_safe_memory", False))
                 from tools.memory_tool import memory_tool as _memory_tool
                 function_result = _memory_tool(
-                    action=function_args.get("action"),
+                    action=action,
                     target=target,
-                    content=function_args.get("content"),
+                    content=content,
                     old_text=function_args.get("old_text"),
                     store=self._memory_store,
+                    cron_safe=cron_safe,
                 )
+                if cron_safe:
+                    try:
+                        parsed = json.loads(function_result)
+                        from cron.scheduler import _audit_cron_memory_write
+                        _audit_cron_memory_write(
+                            job_id=(self.session_id or "").split("_")[1] if (self.session_id or "").startswith("cron_") else "",
+                            session_id=self.session_id or "",
+                            action=str(action or ""),
+                            target=str(target or ""),
+                            success=bool(parsed.get("success")),
+                            content_length=len(content or ""),
+                            error=parsed.get("error"),
+                        )
+                    except Exception:
+                        pass
                 # Bridge: notify external memory provider of built-in memory writes
-                if self._memory_manager and function_args.get("action") in {"add", "replace"}:
+                if (not cron_safe) and self._memory_manager and action in {"add", "replace"}:
                     try:
                         self._memory_manager.on_memory_write(
-                            function_args.get("action", ""),
+                            action or "",
                             target,
-                            function_args.get("content", ""),
+                            content or "",
                             metadata=self._build_memory_write_metadata(
                                 task_id=effective_task_id,
                                 tool_call_id=getattr(tool_call, "id", None),

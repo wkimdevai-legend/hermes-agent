@@ -85,6 +85,85 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+def _job_explicitly_enables_memory_toolset(job: dict) -> bool:
+    """Return True only when the job itself opts into the memory toolset.
+
+    Cron memory writes are intentionally a guarded hybrid: the job must set
+    both ``allow_memory_writes=True`` and explicitly include ``"memory"`` in
+    its per-job ``enabled_toolsets``. Global/default tool visibility is not
+    authorization to attach a memory store.
+    """
+    toolsets = job.get("enabled_toolsets")
+    if not isinstance(toolsets, list):
+        return False
+    return any(str(t).strip() == "memory" for t in toolsets)
+
+
+def _maybe_attach_cron_memory_store(job: dict, agent) -> object | None:
+    """Attach a write-only/cron-safe MemoryStore to an opted-in cron agent.
+
+    This does *not* enable MEMORY/USER PROFILE prompt injection. It only makes
+    the memory tool usable in cron-safe mode, where ``memory_tool`` hard-limits
+    writes to ``action=add`` + ``target=memory`` and strips response readback.
+    """
+    if not job.get("allow_memory_writes"):
+        return None
+    if job.get("no_agent"):
+        return None
+    if not _job_explicitly_enables_memory_toolset(job):
+        return None
+    try:
+        from tools.memory_tool import MemoryStore
+        store = MemoryStore()
+        store.load_from_disk()
+        agent._memory_store = store
+        agent._memory_enabled = False
+        agent._user_profile_enabled = False
+        agent._memory_write_origin = "cron"
+        agent._memory_write_context = "cron_safe"
+        agent._cron_safe_memory = True
+        return store
+    except Exception as exc:
+        logger.warning(
+            "Job '%s': failed to attach cron-safe memory store: %s",
+            job.get("id", "?"), exc,
+        )
+        return None
+
+
+def _audit_cron_memory_write(
+    *,
+    job_id: str,
+    session_id: str,
+    action: str,
+    target: str,
+    success: bool,
+    content_length: int,
+    error: str | None = None,
+) -> None:
+    """Append metadata-only audit record for cron memory tool attempts."""
+    try:
+        audit_dir = _get_hermes_home() / "cron"
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        safe_action = str(action or "")[:64]
+        safe_target = str(target or "")[:64]
+        record = {
+            "timestamp": _hermes_now().isoformat(),
+            "job_id": str(job_id or "")[:128],
+            "session_id": str(session_id or "")[:128],
+            "action": safe_action,
+            "target": safe_target,
+            "success": bool(success),
+            "content_length": int(content_length or 0),
+        }
+        if error:
+            record["error"] = str(error)[:500]
+        with (audit_dir / "memory_audit.log").open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except Exception as exc:
+        logger.warning("Failed to write cron memory audit log: %s", exc)
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -1455,6 +1534,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             session_id=_cron_session_id,
             session_db=_session_db,
         )
+        _maybe_attach_cron_memory_store(job, agent)
         
         # Run the agent with an *inactivity*-based timeout: the job can run
         # for hours if it's actively calling tools / receiving stream tokens,

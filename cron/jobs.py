@@ -496,6 +496,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    allow_memory_writes: bool = False,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -574,6 +575,7 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_allow_memory_writes = bool(allow_memory_writes)
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -582,6 +584,17 @@ def create_job(
         raise ValueError(
             "no_agent=True requires a script — with no agent and no script "
             "there is nothing for the job to run."
+        )
+
+    # no_agent jobs skip the agent entirely, so memory writes (which only flow
+    # through the agent's memory tool) cannot be performed. Reject the
+    # incompatible combo at the API boundary so a misconfigured opt-in never
+    # reaches the scheduler.
+    if normalized_no_agent and normalized_allow_memory_writes:
+        raise ValueError(
+            "allow_memory_writes=True is incompatible with no_agent=True — "
+            "no_agent jobs run a script with no agent and cannot invoke the "
+            "memory tool."
         )
 
     # Normalize context_from: accept str or list of str, store as list or None
@@ -627,6 +640,7 @@ def create_job(
         "origin": origin,  # Tracks where job was created for "origin" delivery
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
+        "allow_memory_writes": normalized_allow_memory_writes,
     }
 
     jobs = load_jobs()
@@ -668,6 +682,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 updates["workdir"] = None
             else:
                 updates["workdir"] = _normalize_workdir(_wd)
+
+        effective_no_agent = bool(updates.get("no_agent", job.get("no_agent", False)))
+        effective_allow_memory_writes = bool(
+            updates.get("allow_memory_writes", job.get("allow_memory_writes", False))
+        )
+        if effective_no_agent and effective_allow_memory_writes:
+            raise ValueError(
+                "allow_memory_writes=True is incompatible with no_agent=True — "
+                "no_agent jobs run a script with no agent and cannot invoke the memory tool."
+            )
 
         updated = _apply_skill_fields({**job, **updates})
         schedule_changed = "schedule" in updates

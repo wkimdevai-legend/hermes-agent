@@ -462,15 +462,50 @@ class MemoryStore:
             raise RuntimeError(f"Failed to write memory file {path}: {e}")
 
 
+def _cron_safe_response(target: str, result: Dict[str, Any]) -> str:
+    """Strip existing entries / readback from a memory tool response.
+
+    Cron sessions have no MEMORY/USER PROFILE block injected into the system
+    prompt. To preserve that gate, the memory tool's response on cron-safe
+    writes must NOT echo the live entries list back — otherwise a tool call
+    would smuggle the entire memory contents into the next assistant turn.
+    Only minimal metadata (success, target, message, usage, entry_count) is
+    returned.
+    """
+    minimal: Dict[str, Any] = {
+        "success": bool(result.get("success", False)),
+        "target": target,
+        "cron_safe": True,
+    }
+    if "message" in result and result["message"]:
+        minimal["message"] = result["message"]
+    if "error" in result and result["error"]:
+        minimal["error"] = result["error"]
+    if "usage" in result:
+        minimal["usage"] = result["usage"]
+    if "entry_count" in result:
+        minimal["entry_count"] = result["entry_count"]
+    return json.dumps(minimal, ensure_ascii=False)
+
+
 def memory_tool(
     action: str,
     target: str = "memory",
     content: str = None,
     old_text: str = None,
     store: Optional[MemoryStore] = None,
+    cron_safe: bool = False,
 ) -> str:
     """
     Single entry point for the memory tool. Dispatches to MemoryStore methods.
+
+    When ``cron_safe=True`` (cron jobs that opted in via
+    ``allow_memory_writes``), this enforces a hard-coded narrow policy at the
+    code level — independent of any prompt instructions:
+      - Only ``action="add"`` is allowed (no replace/remove from cron).
+      - Only ``target="memory"`` is allowed (cron may not touch USER.md).
+      - Responses strip the live ``entries`` list to avoid leaking existing
+        memory contents back to the cron model.
 
     Returns JSON string with results.
     """
@@ -479,6 +514,32 @@ def memory_tool(
 
     if target not in {"memory", "user"}:
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+
+    if cron_safe:
+        # Hard-coded code-level deny gate. Prompt instructions are not enough:
+        # the cron Dreaming Harness must not be able to widen its own scope by
+        # asking the model nicely.
+        if action != "add":
+            return tool_error(
+                f"Cron-safe memory mode only allows action='add'; got '{action}'.",
+                success=False,
+            )
+        if target != "memory":
+            return tool_error(
+                f"Cron-safe memory mode only allows target='memory'; got '{target}'.",
+                success=False,
+            )
+        if not content:
+            return tool_error("Content is required for 'add' action.", success=False)
+        raw_result = store.add(target, content)
+        if not isinstance(raw_result, dict):
+            # Defensive: store.add always returns dict, but never trust the
+            # response shape on the cron path — fall back to a minimal error.
+            return json.dumps(
+                {"success": False, "error": "Unexpected memory store response.", "cron_safe": True},
+                ensure_ascii=False,
+            )
+        return _cron_safe_response(target, raw_result)
 
     if action == "add":
         if not content:

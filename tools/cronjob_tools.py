@@ -277,6 +277,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
+    if job.get("allow_memory_writes"):
+        result["allow_memory_writes"] = True
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
     return result
@@ -302,6 +304,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    allow_memory_writes: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -368,6 +371,7 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                allow_memory_writes=bool(allow_memory_writes),
             )
             return json.dumps(
                 {
@@ -481,6 +485,8 @@ def cronjob(
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
                 updates["workdir"] = _normalize_optional_job_value(workdir) or None
+            if allow_memory_writes is not None:
+                updates["allow_memory_writes"] = bool(allow_memory_writes)
             if no_agent is not None:
                 # Toggling no_agent on/off at update time. If flipping to True,
                 # we need a script to already exist on the job (or be part of
@@ -630,6 +636,11 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "items": {"type": "string"},
                 "description": "Optional list of toolset names to restrict the job's agent to (e.g. [\"web\", \"terminal\", \"file\", \"delegation\"]). When set, only tools from these toolsets are loaded, significantly reducing input token overhead. When omitted, all default tools are loaded. Infer from the job's prompt — e.g. use \"web\" if it calls web_search, \"terminal\" if it runs scripts, \"file\" if it reads files, \"delegation\" if it calls delegate_task. On update, pass an empty array to clear."
             },
+            "allow_memory_writes": {
+                "type": "boolean",
+                "default": False,
+                "description": "Default: False. Explicit per-job opt-in that allows cron-safe memory writes only when enabled_toolsets also includes 'memory'. This does not inject MEMORY/USER PROFILE into cron prompts. no_agent=True jobs cannot use it."
+            },
             "workdir": {
                 "type": "string",
                 "description": "Optional absolute path to run the job from. When set, AGENTS.md / CLAUDE.md / .cursorrules from that directory are injected into the system prompt, and the terminal/file/code_exec tools use it as their working directory — useful for running a job inside a specific project repo. Must be an absolute path that exists. When unset (default), preserves the original behaviour: no project context files, tools use the scheduler's cwd. On update, pass an empty string to clear. Jobs with workdir run sequentially (not parallel) to keep per-job directories isolated."
@@ -682,6 +693,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        allow_memory_writes=args.get("allow_memory_writes"),
         task_id=kw.get("task_id"),
     ))(),
     check_fn=check_cronjob_requirements,
