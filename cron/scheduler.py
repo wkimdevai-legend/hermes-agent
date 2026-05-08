@@ -115,7 +115,12 @@ def _maybe_attach_cron_memory_store(job: dict, agent) -> object | None:
         return None
     try:
         from tools.memory_tool import MemoryStore
-        store = MemoryStore()
+
+        mem_config = (load_config() or {}).get("memory", {})
+        store = MemoryStore(
+            memory_char_limit=mem_config.get("memory_char_limit", 2200),
+            user_char_limit=mem_config.get("user_char_limit", 1375),
+        )
         store.load_from_disk()
         agent._memory_store = store
         agent._memory_enabled = False

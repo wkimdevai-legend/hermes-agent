@@ -217,6 +217,26 @@ class TestMaybeAttachCronMemoryStore:
         from tools.memory_tool import get_memory_dir
         assert get_memory_dir() == cron_env / "memories"
 
+    def test_attached_store_uses_configured_char_limits(self, cron_env):
+        """Cron-safe memory writes honor memory.*_char_limit from config.yaml."""
+        (cron_env / "config.yaml").write_text(
+            "memory:\n  memory_char_limit: 1234\n  user_char_limit: 567\n",
+            encoding="utf-8",
+        )
+        from cron.scheduler import _maybe_attach_cron_memory_store
+
+        agent = _make_fake_agent()
+        job = {
+            "id": "j7",
+            "allow_memory_writes": True,
+            "enabled_toolsets": ["memory"],
+            "no_agent": False,
+        }
+        store = _maybe_attach_cron_memory_store(job, agent)
+        assert store is not None
+        assert store.memory_char_limit == 1234
+        assert store.user_char_limit == 567
+
 
 # ---------------------------------------------------------------------------
 # Cron-safe memory tool — code-level deny gates
