@@ -6,6 +6,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -198,6 +199,44 @@ def _request_gateway_self_restart(pid: int) -> bool:
     except (ProcessLookupError, PermissionError, OSError):
         return False
     return True
+
+
+def _launchd_self_restart_watchdog(pid: int, target: str) -> bool:
+    """Launch a detached launchd recovery helper for in-gateway restarts.
+
+    ``hermes gateway restart`` can be invoked from a terminal tool that is a
+    child of the currently running gateway process.  In that case we cannot
+    safely run ``launchctl kickstart -k`` synchronously: it kills the process
+    tree that is still producing the Telegram response.  The SIGUSR1 self-drain
+    path is the right first step, but launchd has proven able to leave the job
+    stopped after that graceful exit on macOS.  This watchdog waits for the old
+    gateway PID to disappear, then only kickstarts the launchd job if it is not
+    already running.
+    """
+    if pid <= 0 or not target:
+        return False
+    script = f"""
+old_pid={int(pid)}
+target={shlex.quote(target)}
+deadline=$(( $(date +%s) + 180 ))
+while kill -0 "$old_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
+  sleep 0.5
+done
+sleep 2
+if ! launchctl print "$target" 2>/dev/null | /usr/bin/grep -q 'pid ='; then
+  launchctl kickstart -k "$target" >/dev/null 2>&1 || true
+fi
+""".strip()
+    try:
+        subprocess.Popen(
+            ["bash", "-lc", script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        return True
+    except OSError:
+        return False
 
 
 def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
@@ -2997,6 +3036,7 @@ def launchd_restart():
     try:
         pid = get_running_pid()
         if pid is not None and _request_gateway_self_restart(pid):
+            _launchd_self_restart_watchdog(pid, target)
             print("✓ Service restart requested")
             return
         if pid is not None:

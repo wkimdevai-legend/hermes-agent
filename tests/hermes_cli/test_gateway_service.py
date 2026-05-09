@@ -593,6 +593,11 @@ class TestLaunchdServiceRecovery:
             lambda pid: calls.append(("self", pid)) or True,
         )
         monkeypatch.setattr(
+            gateway_cli,
+            "_launchd_self_restart_watchdog",
+            lambda pid, target: calls.append(("watchdog", pid, target)) or True,
+        )
+        monkeypatch.setattr(
             gateway_cli.subprocess,
             "run",
             lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("launchctl should not run")),
@@ -600,7 +605,8 @@ class TestLaunchdServiceRecovery:
 
         gateway_cli.launchd_restart()
 
-        assert calls == [("self", 321)]
+        target = f"{gateway_cli._launchd_domain()}/{gateway_cli.get_launchd_label()}"
+        assert calls == [("self", 321), ("watchdog", 321, target)]
         assert "restart requested" in capsys.readouterr().out.lower()
 
     def test_launchd_stop_uses_bootout_not_kill(self, monkeypatch):
