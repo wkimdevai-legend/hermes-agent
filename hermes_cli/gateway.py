@@ -215,17 +215,42 @@ def _launchd_self_restart_watchdog(pid: int, target: str) -> bool:
     """
     if pid <= 0 or not target:
         return False
+    lock_dir = Path.home() / ".hermes" / "gateway-restart-watchdog.lock"
     script = f"""
 old_pid={int(pid)}
 target={shlex.quote(target)}
+lock_dir={shlex.quote(str(lock_dir))}
 deadline=$(( $(date +%s) + 180 ))
+
+# Single-flight guard: multiple in-gateway restart requests used to spawn
+# overlapping helpers, each of which could kill the freshly relaunched gateway.
+if ! mkdir "$lock_dir" 2>/dev/null; then
+  exit 0
+fi
+trap 'rmdir "$lock_dir" 2>/dev/null || true' EXIT
+
 while kill -0 "$old_pid" 2>/dev/null && [ "$(date +%s)" -lt "$deadline" ]; do
   sleep 0.5
 done
-sleep 2
-if ! launchctl print "$target" 2>/dev/null | /usr/bin/grep -q 'pid ='; then
-  launchctl kickstart -k "$target" >/dev/null 2>&1 || true
+
+# If the old gateway never exited, do not kick launchd. A forced kick here can
+# create a restart loop while active Telegram work is still draining.
+if kill -0 "$old_pid" 2>/dev/null; then
+  exit 0
 fi
+
+# launchd can briefly report no pid while it is already respawning the job.
+# Poll for a stable running pid before deciding a recovery kick is needed.
+for _ in 1 2 3 4 5; do
+  if launchctl print "$target" 2>/dev/null | /usr/bin/grep -q 'pid ='; then
+    exit 0
+  fi
+  sleep 2
+done
+
+# Start only if absent. Do not use `kickstart -k`: killing a newly running
+# gateway is exactly what caused Woo's repeated Telegram restart alerts.
+launchctl kickstart "$target" >/dev/null 2>&1 || true
 """.strip()
     try:
         subprocess.Popen(
