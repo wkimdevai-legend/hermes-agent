@@ -27,6 +27,7 @@ from agent.auxiliary_client import (
     _try_payment_fallback,
     _resolve_auto,
     _CodexCompletionsAdapter,
+    _get_task_timeout,
 )
 
 
@@ -58,6 +59,43 @@ def codex_auth_dir(tmp_path, monkeypatch):
         lambda: "codex-test-token-abc123",
     )
     return codex_dir
+
+
+class TestAuxiliaryTaskTimeout:
+    def test_session_search_default_timeout_is_not_30s(self):
+        assert _get_task_timeout("session_search") >= 90
+
+    @pytest.mark.asyncio
+    async def test_async_call_llm_passes_configured_session_search_timeout(self):
+        client = MagicMock()
+        client.base_url = "https://example.test/v1"
+        captured = {}
+
+        async def fake_create(**kwargs):
+            captured.update(kwargs)
+            return {"ok": True}
+
+        client.chat.completions.create = AsyncMock(side_effect=fake_create)
+
+        with (
+            patch(
+                "agent.auxiliary_client._get_auxiliary_task_config",
+                return_value={"provider": "auto", "timeout": 180, "extra_body": {}},
+            ),
+            patch(
+                "agent.auxiliary_client._resolve_task_provider_model",
+                return_value=("auto", "test-model", None, None, None),
+            ),
+            patch("agent.auxiliary_client._get_cached_client", return_value=(client, "test-model")),
+            patch("agent.auxiliary_client._validate_llm_response", side_effect=lambda resp, _task: resp),
+        ):
+            result = await async_call_llm(
+                task="session_search",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+
+        assert result == {"ok": True}
+        assert captured["timeout"] == 180
 
 
 class TestAuxiliaryMaxTokensParam:

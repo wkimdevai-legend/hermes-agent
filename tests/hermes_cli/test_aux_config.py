@@ -42,11 +42,14 @@ def test_title_generation_present_in_default_config():
     assert tg["extra_body"] == {}
 
 
-def test_session_search_defaults_include_extra_body_and_concurrency():
+def test_session_search_defaults_include_extra_body_concurrency_and_sane_timeout():
     ss = DEFAULT_CONFIG["auxiliary"]["session_search"]
     assert ss["provider"] == "auto"
     assert ss["model"] == ""
     assert ss["extra_body"] == {}
+    # Session-search summarizes full past transcripts. 30s caused repeated
+    # Codex auxiliary timeout storms in long gateway sessions.
+    assert ss["timeout"] >= 90
     assert ss["max_concurrency"] == 3
 
 

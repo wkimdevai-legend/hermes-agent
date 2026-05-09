@@ -844,7 +844,12 @@ DEFAULT_CONFIG = {
             "model": "",
             "base_url": "",
             "api_key": "",
-            "timeout": 30,
+            # Session-search summaries often run over large past transcripts.
+            # The previous 30s default was too aggressive for Codex/Responses
+            # auxiliary routing and caused repeated timeout storms in long
+            # Telegram sessions. Keep fast providers fast via max_concurrency,
+            # but give the per-summary LLM call enough time to finish.
+            "timeout": 180,
             "extra_body": {},
             "max_concurrency": 3,  # Clamp parallel summaries to avoid request-burst 429s on small providers
         },
