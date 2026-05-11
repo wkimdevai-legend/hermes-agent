@@ -2637,8 +2637,17 @@ class HermesCLI:
         self._voice_tts_done = threading.Event()
         self._voice_tts_done.set()
 
-        # Status bar visibility (toggled via /statusbar)
-        self._status_bar_visible = True
+        # Status bar visibility (toggled via /statusbar).  Classic REPL runs
+        # prompt_toolkit in the primary buffer; on some terminals/iTerm resize
+        # reflow can stamp footer rows into scrollback.  Allow users to start
+        # with the footer disabled while keeping /statusbar as a live toggle.
+        _status_bar_default = (self.config.get("display") or {}).get("status_bar", True)
+        _status_bar_env = os.getenv("HERMES_CLASSIC_STATUS_BAR")
+        if _status_bar_env is not None:
+            _status_bar_default = _status_bar_env.strip().lower() not in {"0", "false", "no", "off", "hidden"}
+        elif isinstance(_status_bar_default, str):
+            _status_bar_default = _status_bar_default.strip().lower() not in {"0", "false", "no", "off", "hidden"}
+        self._status_bar_visible = bool(_status_bar_default)
         self._resize_recovery_lock = threading.Lock()
         self._resize_recovery_timer = None
         self._resize_recovery_pending = False
