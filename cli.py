@@ -10528,11 +10528,21 @@ class HermesCLI:
                             break
                     except queue.Empty:
                         # Force prompt_toolkit to flush any pending stdout
-                        # output from the agent thread.  Without this, the
+                        # output from the agent thread. Without this, the
                         # StdoutProxy buffer only flushes on renderer passes
                         # triggered by input events — on macOS this causes
                         # the CLI to appear frozen until the user types. (#1624)
-                        self._invalidate(min_interval=0.15)
+                        #
+                        # However, the classic CLI runs prompt_toolkit in the
+                        # primary terminal buffer.  During long model waits,
+                        # repainting the full-width status/input chrome every
+                        # 150ms can stamp duplicate footer frames into native
+                        # scrollback when the terminal is resizing/reflowing.
+                        # One repaint per second is enough to keep stdout and
+                        # the elapsed-time status fresh without a 6.7fps redraw
+                        # storm.  Streaming/tool output still prints as it
+                        # arrives; this only throttles the idle wait-loop flush.
+                        self._invalidate(min_interval=1.0)
                 else:
                     # Fallback for non-interactive mode (e.g., single-query)
                     agent_thread.join(0.1)
