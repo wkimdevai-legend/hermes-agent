@@ -8512,6 +8512,49 @@ class HermesCLI:
         else:
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only){_RST}")
 
+    def _coalesce_pending_busy_queue(self, first_input):
+        """Merge consecutive queued plain-text busy inputs into one next turn.
+
+        In ``display.busy_input_mode=queue``, users often type short
+        messenger-style fragments while Hermes is still busy (for example,
+        ``왜`` → ``이렇게`` → ``자꾸``).  Treat those as one follow-up prompt
+        once the current run finishes instead of processing them as separate
+        turns.  Stop at slash commands or non-text payloads so explicit
+        commands and image submissions keep their original ordering/semantics.
+        """
+        if not isinstance(first_input, str) or _looks_like_slash_command(first_input):
+            return first_input
+
+        pending = getattr(self, "_pending_input", None)
+        if pending is None:
+            return first_input
+
+        parts = [first_input]
+        restore = []
+        while True:
+            try:
+                item = pending.get_nowait()
+            except queue.Empty:
+                break
+
+            if isinstance(item, str) and item and not _looks_like_slash_command(item):
+                parts.append(item)
+                continue
+
+            restore.append(item)
+            break
+
+        # Preserve any queued items after the first non-coalescible boundary.
+        while True:
+            try:
+                restore.append(pending.get_nowait())
+            except queue.Empty:
+                break
+        for item in restore:
+            pending.put(item)
+
+        return "\n\n".join(parts) if len(parts) > 1 else first_input
+
     def _handle_busy_command(self, cmd: str):
         """Handle /busy — control what Enter does while Hermes is working.
 
@@ -12983,6 +13026,8 @@ class HermesCLI:
                     
                     if not user_input:
                         continue
+
+                    user_input = self._coalesce_pending_busy_queue(user_input)
 
                     # Unpack image payload: (text, [Path, ...]) or plain str
                     submit_images = []
