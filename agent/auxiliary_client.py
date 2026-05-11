@@ -719,7 +719,11 @@ class _CodexCompletionsAdapter:
 
         def _check_cancelled() -> None:
             if deadline is not None and time.monotonic() >= deadline:
-                timed_out.set()
+                # The polling path can notice the deadline before the timer
+                # thread runs.  Close and evict synchronously too, otherwise
+                # tests (and callers) can observe a timed-out but still-cached
+                # poisoned Codex client.
+                _close_client_on_timeout()
                 raise TimeoutError(_timeout_message())
             try:
                 from tools.interrupt import is_interrupted
