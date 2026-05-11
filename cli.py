@@ -2703,8 +2703,16 @@ class HermesCLI:
             pass
 
     def _recover_after_resize(self, app, original_on_resize) -> None:
-        """Recover a resized classic CLI without desynchronizing cursor state."""
-        self._clear_prompt_toolkit_screen(app, rebuild_scrollback=True)
+        """Recover a resized classic CLI without desynchronizing cursor state.
+
+        Do not clear the terminal scrollback here. DECSET 3J (``\x1b[3J``)
+        removes the user's native terminal history, which makes completed chat
+        content disappear after a resize. The resize recovery only needs to
+        clear the visible prompt_toolkit frame before replaying Hermes' output
+        history; preserving scrollback is the less destructive default even if
+        a terminal may briefly show resize ghosting artifacts.
+        """
+        self._clear_prompt_toolkit_screen(app, rebuild_scrollback=False)
         _replay_output_history()
         original_on_resize()
 
