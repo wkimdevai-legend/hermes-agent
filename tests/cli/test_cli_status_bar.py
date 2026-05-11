@@ -11,6 +11,7 @@ def _make_cli(model: str = "anthropic/claude-sonnet-4-20250514"):
     cli_obj.model = model
     cli_obj.session_start = datetime.now() - timedelta(minutes=14, seconds=32)
     cli_obj.conversation_history = [{"role": "user", "content": "hi"}]
+    cli_obj.config = {"display": {}}
     cli_obj.agent = None
     return cli_obj
 
@@ -206,6 +207,36 @@ class TestCLIStatusBar:
 
         assert "⚕" in text
         assert "claude-sonnet-4-20250514" in text
+
+    def test_busy_chrome_defaults_to_enabled(self):
+        cli_obj = _make_cli()
+        cli_obj._agent_running = True
+
+        assert cli_obj._classic_busy_chrome_enabled() is True
+        assert cli_obj._suppress_agent_busy_chrome() is False
+        assert cli_obj._tui_input_rule_height("top", width=120) == 1
+
+    def test_busy_chrome_can_be_disabled_during_agent_run(self):
+        cli_obj = _make_cli()
+        cli_obj.config = {"display": {"busy_chrome": False}}
+        cli_obj._agent_running = True
+        cli_obj._spinner_text = "ruminating..."
+        cli_obj._tool_start_time = 0
+
+        assert cli_obj._classic_busy_chrome_enabled() is False
+        assert cli_obj._suppress_agent_busy_chrome() is True
+        assert cli_obj._tui_input_rule_height("top", width=120) == 0
+        assert cli_obj._tui_input_rule_height("bottom", width=120) == 0
+        assert cli_obj._agent_spacer_height(width=120) == 0
+        assert cli_obj._render_spinner_text() == ""
+
+    def test_busy_chrome_disabled_does_not_hide_idle_rules(self):
+        cli_obj = _make_cli()
+        cli_obj.config = {"display": {"busy_chrome": False}}
+        cli_obj._agent_running = False
+
+        assert cli_obj._suppress_agent_busy_chrome() is False
+        assert cli_obj._tui_input_rule_height("top", width=120) == 1
 
     def test_compression_count_shown_in_wide_status_bar(self):
         cli_obj = _attach_agent(

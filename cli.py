@@ -2957,10 +2957,31 @@ class HermesCLI:
             width = self._get_tui_terminal_width()
         return width < 64
 
+    def _classic_busy_chrome_enabled(self) -> bool:
+        """Whether to show live busy chrome while the classic REPL is running.
+
+        In non-full-screen prompt_toolkit mode, resize/reflow can stamp live
+        spinner, input rules, and interrupt placeholders into native scrollback.
+        Let long-running local sessions opt into a quieter, resize-stable busy
+        state while preserving normal idle input and slash-command prompts.
+        """
+        raw = (self.config.get("display") or {}).get("busy_chrome", True)
+        env = os.getenv("HERMES_CLASSIC_BUSY_CHROME")
+        if env is not None:
+            raw = env
+        if isinstance(raw, str):
+            return raw.strip().lower() not in {"0", "false", "no", "off", "hidden"}
+        return bool(raw)
+
+    def _suppress_agent_busy_chrome(self) -> bool:
+        return bool(getattr(self, "_agent_running", False)) and not self._classic_busy_chrome_enabled()
+
     def _tui_input_rule_height(self, position: str, width: Optional[int] = None) -> int:
         """Return the visible height for the top/bottom input separator rules."""
         if position not in {"top", "bottom"}:
             raise ValueError(f"Unknown input rule position: {position}")
+        if self._suppress_agent_busy_chrome():
+            return 0
         if position == "top":
             return 1
         return 0 if self._use_minimal_tui_chrome(width=width) else 1
@@ -2968,6 +2989,8 @@ class HermesCLI:
     def _agent_spacer_height(self, width: Optional[int] = None) -> int:
         """Return the spacer height shown above the status bar while the agent runs."""
         if not getattr(self, "_agent_running", False):
+            return 0
+        if self._suppress_agent_busy_chrome():
             return 0
         return 0 if self._use_minimal_tui_chrome(width=width) else 1
 
@@ -2987,6 +3010,8 @@ class HermesCLI:
 
     def _render_spinner_text(self) -> str:
         """Return the live spinner/status text exactly as rendered in the TUI."""
+        if self._suppress_agent_busy_chrome():
+            return ""
         txt = getattr(self, "_spinner_text", "")
         if not txt:
             return ""
@@ -12276,6 +12301,8 @@ class HermesCLI:
                 status = cli_ref._command_status or "Processing command..."
                 return f"{frame} {status}"
             if cli_ref._agent_running:
+                if cli_ref._suppress_agent_busy_chrome():
+                    return ""
                 return "msg=interrupt · /queue · /bg · /steer · Ctrl+C cancel"
             if cli_ref._voice_mode:
                 _label = cli_ref._voice_record_key_label()
