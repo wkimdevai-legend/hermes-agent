@@ -2688,7 +2688,7 @@ class HermesCLI:
             out = renderer.output
             out.reset_attributes()
             out.erase_screen()
-            if rebuild_scrollback:
+            if rebuild_scrollback and os.environ.get("HERMES_CLASSIC_CLEAR_SCROLLBACK_ON_RESIZE") == "1":
                 try:
                     out.write_raw("\x1b[3J")
                 except Exception:
@@ -12854,6 +12854,13 @@ class HermesCLI:
             style=style,
             full_screen=False,
             mouse_support=False,
+            # Classic REPL runs in the primary buffer, so every prompt_toolkit
+            # repaint can enter native scrollback if the terminal resizes while
+            # full-width status/input chrome is visible.  Throttle redraws to
+            # coalesce resize bursts and spinner ticks instead of stamping each
+            # intermediate frame into scrollback.  See prompt-toolkit issue #1933.
+            min_redraw_interval=0.15,
+            max_render_postpone_time=0.15,
             **({'cursor': _STEADY_CURSOR} if _STEADY_CURSOR is not None else {}),
         )
         _disable_prompt_toolkit_cpr_warning(app)
