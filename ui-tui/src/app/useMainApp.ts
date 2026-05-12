@@ -25,7 +25,7 @@ import { buildToolTrailLine, sameToolTrailGroup, toolTrailLabel } from '../lib/t
 import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
-import { coalesceIntegratedQueue } from './busyIntegrated.js'
+import { coveredIntentsFromSettledTurn, resolveIntegratedQueueDrain } from './busyIntegrated.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { getInputSelection } from './inputSelectionStore.js'
@@ -517,9 +517,12 @@ export function useMainApp(gw: GatewayClient) {
   //
   // Under `busy_input_mode: integrated` (CLI parity) the leading run of queued
   // plain-text fragments is coalesced into ONE wrapped follow-up rather than
-  // replayed as N sequential turns; a slash-command queue entry is a hard
-  // boundary that ends the run and is left in place. Other modes drain one
-  // item per settle, as before.
+  // replayed as N sequential turns; a slash-command (or file/media-drop) queue
+  // entry is a hard boundary that ends the run and is left in place. The drain
+  // also resolves the run against what the turn that just settled covered:
+  // duplicates of an already-answered TODO/iteration recap are consumed (dropped,
+  // not replayed as a second full answer), while status queries always survive
+  // (live status drifts). Other modes drain one item per settle, as before.
   useEffect(() => {
     if (
       !ui.sid ||
@@ -533,7 +536,22 @@ export function useMainApp(gw: GatewayClient) {
     const q = composerRefs.queueRef.current
 
     if (ui.busyInputMode === 'integrated') {
-      const { send, remaining } = coalesceIntegratedQueue(q)
+      // Front-desk acknowledgement: before replaying queued follow-ups, ask what
+      // the turn that just settled already covered. The one structured artifact
+      // the TUI records today is the archived TODO trail (a `kind: 'trail'`
+      // history item carrying that turn's `todos`), so a busy-time "todo는?"
+      // recap duplicate is consumed instead of triggering a second full answer.
+      // Status queries always survive (live status drifts); generic steering,
+      // slash commands and file/media drops always survive.
+      //
+      // TODO(integrated-queue-lifecycle): iteration-plan / worker-status coverage
+      // still needs an agent-emitted per-turn signal (the TUI has no comparable
+      // artifact for those). The product-correct successor is a `{ id, text,
+      // lifecycle }` queue that records per-item acknowledgement instead of a
+      // `string[]` resolved by after-the-fact heuristics; resolution stays
+      // centralised in `resolveIntegratedQueueDrain` either way.
+      const coveredIntents = coveredIntentsFromSettledTurn(historyItemsRef.current)
+      const { remaining, send } = resolveIntegratedQueueDrain(q, { coveredIntents })
 
       if (remaining.length !== q.length) {
         q.splice(0, q.length, ...remaining)
@@ -554,7 +572,7 @@ export function useMainApp(gw: GatewayClient) {
       patchUiState({ busy: true, status: 'running…' })
       sendQueued(next)
     }
-  }, [ui.sid, ui.busy, ui.busyInputMode, composerActions, composerRefs, sendQueued])
+  }, [ui.sid, ui.busy, ui.busyInputMode, composerActions, composerRefs, historyItemsRef, sendQueued])
 
   const { pagerPageSize } = useInputHandlers({
     actions: {
