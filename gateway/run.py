@@ -1990,8 +1990,10 @@ class GatewayRunner:
     def _queue_during_drain_enabled(self) -> bool:
         # Both "queue" and "steer" modes imply the user doesn't want messages
         # to be lost during restart — queue them for the newly-spawned gateway
-        # process to pick up.  "interrupt" mode drops them (current behaviour).
-        return self._restart_requested and self._busy_input_mode in {"queue", "steer"}
+        # process to pick up.  "integrated" is CLI-only in Phase 1 but degrades
+        # to queue-like gateway behaviour.  "interrupt" mode drops them
+        # (current behaviour).
+        return self._restart_requested and self._busy_input_mode in {"queue", "integrated", "steer"}
 
     # -------- /queue FIFO helpers --------------------------------------
     # /queue must produce one full agent turn per invocation, in FIFO
@@ -2350,6 +2352,12 @@ class GatewayRunner:
                 pass
         if mode == "queue":
             return "queue"
+        if mode == "integrated":
+            # Phase 1 implements integrated wrapping in the CLI only.  The
+            # gateway shares display.busy_input_mode, so degrade integrated to
+            # queue-like behavior rather than surprising users by falling back
+            # to interrupt.
+            return "integrated"
         if mode == "steer":
             return "steer"
         return "interrupt"
@@ -2546,7 +2554,7 @@ class GatewayRunner:
         if not steered:
             merge_pending_message_event(adapter._pending_messages, session_key, event)
 
-        is_queue_mode = effective_mode == "queue"
+        is_queue_mode = effective_mode in {"queue", "integrated"}
         is_steer_mode = effective_mode == "steer"
 
         # If not in queue/steer mode, interrupt the running agent immediately.
@@ -2628,6 +2636,8 @@ class GatewayRunner:
             if not is_seen(_user_cfg, BUSY_INPUT_FLAG):
                 if is_steer_mode:
                     _hint_mode = "steer"
+                elif effective_mode == "integrated":
+                    _hint_mode = "integrated"
                 elif is_queue_mode:
                     _hint_mode = "queue"
                 else:
@@ -6238,7 +6248,7 @@ class GatewayRunner:
                     if self._queue_during_drain_enabled()
                     else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
                 )
-            if self._busy_input_mode == "queue":
+            if self._busy_input_mode in {"queue", "integrated"}:
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
                 return None

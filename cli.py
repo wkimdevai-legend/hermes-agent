@@ -2182,6 +2182,16 @@ def _looks_like_slash_command(text: str) -> bool:
     return "/" not in first_word[1:]
 
 
+# Identity-only tag used to mark plain-text fragments captured while Hermes was
+# busy under ``display.busy_input_mode=integrated``.  Stored in
+# ``_pending_input`` as ``(_INTEGRATED_BUSY_PAYLOAD, text)`` so the drain step
+# can tell busy-time follow-ups apart from ordinary idle messages and only wrap
+# the former.  This must not be a string: image payloads are also two-tuples of
+# ``(caption, images)``, and a caption such as "integrated_busy" must remain a
+# normal image payload.
+_INTEGRATED_BUSY_PAYLOAD = object()
+
+
 # ============================================================================
 # Skill Slash Commands — dynamic commands generated from installed skills
 # ============================================================================
@@ -2332,13 +2342,17 @@ class HermesCLI:
             max_lines=CLI_CONFIG["display"].get("persistent_output_max_lines", 200),
         )
         # busy_input_mode: "interrupt" (Enter interrupts current run),
-        # "queue" (Enter queues for next turn), or "steer" (Enter injects
-        # mid-run via /steer, arriving after the next tool call).
+        # "queue" (Enter queues for next turn), "steer" (Enter injects
+        # mid-run via /steer, arriving after the next tool call), or
+        # "integrated" (Enter queues like "queue" but tags busy-time
+        # fragments so they are wrapped as one integrated follow-up next turn).
         _bim = str(CLI_CONFIG["display"].get("busy_input_mode", "interrupt")).strip().lower()
         if _bim == "queue":
             self.busy_input_mode = "queue"
         elif _bim == "steer":
             self.busy_input_mode = "steer"
+        elif _bim == "integrated":
+            self.busy_input_mode = "integrated"
         else:
             self.busy_input_mode = "interrupt"
 
@@ -8555,6 +8569,130 @@ class HermesCLI:
 
         return "\n\n".join(parts) if len(parts) > 1 else first_input
 
+    # ------------------------------------------------------------------
+    # Integrated busy mode (display.busy_input_mode=integrated)
+    #
+    # Phase 1 keeps integrated mode behaving like ``queue`` at capture time,
+    # except plain-text fragments typed while Hermes is busy are stored as a
+    # tagged ``(_INTEGRATED_BUSY_PAYLOAD, text)`` tuple.  At drain time only
+    # tagged payloads are wrapped as an explicit "captured while busy"
+    # follow-up — ordinary idle messages stay untouched even when the mode is
+    # ``integrated``.  Slash commands and image/media payloads remain hard
+    # boundaries and are never folded into the integrated text.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_integrated_busy_payload(payload):
+        """Wrap *payload* (plain text) as an integrated busy-time fragment."""
+        return (_INTEGRATED_BUSY_PAYLOAD, payload)
+
+    @staticmethod
+    def _is_integrated_busy_payload(item) -> bool:
+        """Return True if *item* is a tagged integrated busy-time fragment."""
+        return (
+            isinstance(item, tuple)
+            and len(item) == 2
+            and item[0] == _INTEGRATED_BUSY_PAYLOAD
+        )
+
+    @staticmethod
+    def _unwrap_integrated_busy_payload(item):
+        """Return the inner payload of a tagged fragment, or *item* unchanged."""
+        return item[1] if HermesCLI._is_integrated_busy_payload(item) else item
+
+    def _busy_payload_for_mode(self, text, images):
+        """Return ``(payload, effective_mode)`` for a busy-time Enter submission.
+
+        In ``integrated`` mode a plain-text submission (no images) is tagged so
+        the next turn can present it as an integrated follow-up.  Submissions
+        carrying images — or empty text — fall back to a plain queued payload
+        (images cannot ride along inside the integrated text wrapper).
+        """
+        payload = (text, images) if images else text
+        if self.busy_input_mode == "integrated" and text and not images:
+            return HermesCLI._make_integrated_busy_payload(text), "integrated"
+        return payload, self.busy_input_mode
+
+    def _format_integrated_busy_input(self, text: str) -> str:
+        """Wrap coalesced integrated busy-time fragments as a follow-up prompt."""
+        return (
+            "Additional user input arrived while Hermes was working "
+            "(captured under /busy integrated). Integrate the following "
+            "follow-up with the task or result you were just producing. Do not "
+            "treat it as an unrelated new topic unless the user clearly asks.\n\n"
+            f"{text}"
+        )
+
+    def _coalesce_pending_integrated_busy_queue(self, first_text: str):
+        """Merge adjacent integrated busy-time text fragments into one string.
+
+        Only consecutive tagged plain-text fragments are joined (with
+        ``\\n\\n``).  The first non-text / slash-command / untagged item ends
+        the run and, together with everything after it, is restored to
+        ``_pending_input`` in its original order.
+        """
+        pending = getattr(self, "_pending_input", None)
+        if pending is None:
+            return first_text
+
+        parts = [first_text]
+        restore = []
+        while True:
+            try:
+                item = pending.get_nowait()
+            except queue.Empty:
+                break
+
+            if HermesCLI._is_integrated_busy_payload(item):
+                unwrapped = HermesCLI._unwrap_integrated_busy_payload(item)
+                if (
+                    isinstance(unwrapped, str)
+                    and unwrapped
+                    and not _looks_like_slash_command(unwrapped)
+                ):
+                    parts.append(unwrapped)
+                    continue
+                restore.append(unwrapped)
+                break
+
+            restore.append(item)
+            break
+
+        # Preserve any queued items after the first non-coalescible boundary.
+        while True:
+            try:
+                restore.append(pending.get_nowait())
+            except queue.Empty:
+                break
+        for item in restore:
+            pending.put(item)
+
+        return "\n\n".join(parts) if len(parts) > 1 else first_text
+
+    def _prepare_pending_input_for_turn(self, first_input):
+        """Prepare a freshly-dequeued pending input for the next agent turn.
+
+        Plain ``queue``-style inputs keep the existing coalescing behavior.
+        Tagged integrated busy-time fragments are coalesced among themselves
+        and then wrapped with an explicit "captured while busy" preamble so
+        Hermes knows they were fragmented follow-ups.  Slash-command payloads
+        (even if somehow tagged) are passed through untouched so they remain
+        commands rather than model text.
+        """
+        if not HermesCLI._is_integrated_busy_payload(first_input):
+            return HermesCLI._coalesce_pending_busy_queue(self, first_input)
+
+        first_text = HermesCLI._unwrap_integrated_busy_payload(first_input)
+        if not isinstance(first_text, str) or not first_text:
+            # Defensive: a tagged payload that is not usable text — restore the
+            # raw value and let downstream handling deal with it.
+            return first_text
+        if _looks_like_slash_command(first_text):
+            return first_text
+
+        combined = HermesCLI._coalesce_pending_integrated_busy_queue(self, first_text)
+        return HermesCLI._format_integrated_busy_input(self, combined)
+
     def _handle_busy_command(self, cmd: str):
         """Handle /busy — control what Enter does while Hermes is working.
 
@@ -8562,6 +8700,8 @@ class HermesCLI:
             /busy               Show current busy input mode
             /busy status        Show current busy input mode
             /busy queue         Queue input for the next turn instead of interrupting
+            /busy integrated    Queue like 'queue' but bundle busy-time fragments
+                                into one integrated follow-up next turn
             /busy steer         Inject Enter mid-run via /steer (after next tool call)
             /busy interrupt     Interrupt the current run on Enter (default)
         """
@@ -8570,24 +8710,28 @@ class HermesCLI:
             _cprint(f"  {_ACCENT}Busy input mode: {self.busy_input_mode}{_RST}")
             if self.busy_input_mode == "queue":
                 _behavior = "queues for next turn"
+            elif self.busy_input_mode == "integrated":
+                _behavior = "collects fragmented follow-ups and integrates them after the current run"
             elif self.busy_input_mode == "steer":
                 _behavior = "steers into current run (after next tool call)"
             else:
                 _behavior = "interrupts current run"
             _cprint(f"  {_DIM}Enter while busy: {_behavior}{_RST}")
-            _cprint(f"  {_DIM}Usage: /busy [queue|steer|interrupt|status]{_RST}")
+            _cprint(f"  {_DIM}Usage: /busy [queue|integrated|steer|interrupt|status]{_RST}")
             return
 
         arg = parts[1].strip().lower()
-        if arg not in {"queue", "interrupt", "steer"}:
+        if arg not in {"queue", "integrated", "interrupt", "steer"}:
             _cprint(f"  {_DIM}(._.) Unknown argument: {arg}{_RST}")
-            _cprint(f"  {_DIM}Usage: /busy [queue|steer|interrupt|status]{_RST}")
+            _cprint(f"  {_DIM}Usage: /busy [queue|integrated|steer|interrupt|status]{_RST}")
             return
 
         self.busy_input_mode = arg
         if save_config_value("display.busy_input_mode", arg):
             if arg == "queue":
                 behavior = "Enter will queue follow-up input while Hermes is busy."
+            elif arg == "integrated":
+                behavior = "Enter will collect fragmented follow-ups while Hermes is busy and integrate them as one continuation after the current run."
             elif arg == "steer":
                 behavior = "Enter will steer your message into the current run (after the next tool call)."
             else:
@@ -11471,11 +11615,23 @@ class HermesCLI:
                                 _cprint(f"  {_ACCENT}⏩ Steered: '{preview}'{_RST}")
                             else:
                                 _effective_mode = "queue"
-                    if _effective_mode == "queue":
-                        # Queue for the next turn instead of interrupting
-                        self._pending_input.put(payload)
+                    if _effective_mode in {"queue", "integrated"}:
+                        # Queue for the next turn instead of interrupting.  In
+                        # "integrated" mode, tag plain-text fragments so the
+                        # drain step can wrap them as one integrated follow-up
+                        # captured while busy.  Images / empty text fall back to
+                        # a plain queued payload (they can't ride the wrapper).
+                        queued_payload = payload
+                        _tagged_integrated = False
+                        if _effective_mode == "integrated" and text and not images:
+                            queued_payload = self._make_integrated_busy_payload(text)
+                            _tagged_integrated = True
+                        self._pending_input.put(queued_payload)
                         preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
-                        _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
+                        if _tagged_integrated:
+                            _cprint(f"  Will integrate after the current turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
+                        else:
+                            _cprint(f"  Queued for the next turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
                     elif _effective_mode == "interrupt":
                         self._interrupt_queue.put(payload)
                         # Debug: log to file when message enters interrupt queue
@@ -13027,7 +13183,7 @@ class HermesCLI:
                     if not user_input:
                         continue
 
-                    user_input = self._coalesce_pending_busy_queue(user_input)
+                    user_input = self._prepare_pending_input_for_turn(user_input)
 
                     # Unpack image payload: (text, [Path, ...]) or plain str
                     submit_images = []

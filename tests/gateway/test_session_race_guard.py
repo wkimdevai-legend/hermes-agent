@@ -300,6 +300,28 @@ async def test_recent_telegram_followups_append_in_pending_queue():
     assert adapter._pending_messages[session_key].text == "part one\npart two"
 
 
+@pytest.mark.asyncio
+async def test_integrated_busy_mode_queues_active_session_without_interrupt(monkeypatch):
+    runner = _make_runner()
+    runner._busy_input_mode = "integrated"
+    monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "0")
+    event = _make_event(text="integrated follow-up")
+    session_key = build_session_key(event.source)
+
+    fake_agent = MagicMock()
+    fake_agent.get_activity_summary.return_value = {"seconds_since_activity": 0}
+    runner._running_agents[session_key] = fake_agent
+    import time as _time
+    runner._running_agents_ts[session_key] = _time.time() - 30
+
+    result = await runner._handle_message(event)
+
+    assert result is None
+    fake_agent.interrupt.assert_not_called()
+    adapter = runner.adapters[Platform.TELEGRAM]
+    assert adapter._pending_messages[session_key].text == "integrated follow-up"
+
+
 # ------------------------------------------------------------------
 # Test 5: Sentinel not placed for command messages
 # ------------------------------------------------------------------
