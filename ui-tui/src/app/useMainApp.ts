@@ -25,6 +25,7 @@ import { buildToolTrailLine, sameToolTrailGroup, toolTrailLabel } from '../lib/t
 import { estimatedMsgHeight, messageHeightKey } from '../lib/virtualHeights.js'
 import type { Msg, PanelSection, SlashCatalog } from '../types.js'
 
+import { coalesceIntegratedQueue } from './busyIntegrated.js'
 import { createGatewayEventHandler } from './createGatewayEventHandler.js'
 import { createSlashHandler } from './createSlashHandler.js'
 import { getInputSelection } from './inputSelectionStore.js'
@@ -508,11 +509,17 @@ export function useMainApp(gw: GatewayClient) {
     sys
   })
 
-  // Drain one queued message whenever the session settles (busy → false):
+  // Drain queued message(s) whenever the session settles (busy → false):
   // agent turn ends, interrupt, shell.exec finishes, error recovered, or the
   // session first comes up with pre-queued messages. Without this, shell.exec
   // and error paths never emit message.complete, so anything enqueued while
   // `!sleep` / a failed turn was running would stay stuck forever.
+  //
+  // Under `busy_input_mode: integrated` (CLI parity) the leading run of queued
+  // plain-text fragments is coalesced into ONE wrapped follow-up rather than
+  // replayed as N sequential turns; a slash-command queue entry is a hard
+  // boundary that ends the run and is left in place. Other modes drain one
+  // item per settle, as before.
   useEffect(() => {
     if (
       !ui.sid ||
@@ -523,13 +530,31 @@ export function useMainApp(gw: GatewayClient) {
       return
     }
 
+    const q = composerRefs.queueRef.current
+
+    if (ui.busyInputMode === 'integrated') {
+      const { send, remaining } = coalesceIntegratedQueue(q)
+
+      if (remaining.length !== q.length) {
+        q.splice(0, q.length, ...remaining)
+        composerActions.syncQueue()
+      }
+
+      if (send !== undefined) {
+        patchUiState({ busy: true, status: 'running…' })
+        sendQueued(send)
+
+        return
+      }
+    }
+
     const next = composerActions.dequeue()
 
     if (next) {
       patchUiState({ busy: true, status: 'running…' })
       sendQueued(next)
     }
-  }, [ui.sid, ui.busy, composerActions, composerRefs, sendQueued])
+  }, [ui.sid, ui.busy, ui.busyInputMode, composerActions, composerRefs, sendQueued])
 
   const { pagerPageSize } = useInputHandlers({
     actions: {

@@ -216,12 +216,16 @@ export function useSubmission(opts: UseSubmissionOptions) {
   )
 
   // Honors `display.busy_input_mode` from config.yaml (CLI parity):
-  //   - 'queue'     (legacy): append to queueRef; drains on busy → false
-  //   - 'steer'     : inject into the current turn via session.steer; falls
-  //                   back to queue when steer is rejected (no agent / no
-  //                   tool window).
-  //   - 'interrupt' (default): cancel the in-flight turn, then send the
-  //                   new text as a fresh prompt so it actually moves.
+  //   - 'queue'      (legacy): append to queueRef; drains on busy → false
+  //   - 'integrated' : like 'queue' at capture time (never interrupts), but the
+  //                    drain step (useMainApp) coalesces the leading run of
+  //                    queued plain-text fragments into one wrapped follow-up
+  //                    instead of replaying them as N sequential turns.
+  //   - 'steer'      : inject into the current turn via session.steer; falls
+  //                    back to queue when steer is rejected (no agent / no
+  //                    tool window).
+  //   - 'interrupt'  (default): cancel the in-flight turn, then send the
+  //                    new text as a fresh prompt so it actually moves.
   //
   // `opts.fallbackToFront` controls whether a steer fallback re-inserts
   // at the front of the queue (used by the queue-edit path to preserve
@@ -242,7 +246,9 @@ export function useSubmission(opts: UseSubmissionOptions) {
         sys(note)
       }
 
-      if (mode === 'queue') {
+      if (mode === 'queue' || mode === 'integrated') {
+        // 'integrated' queues like 'queue' here; the drain step coalesces the
+        // queued run into one wrapped follow-up (never interrupts).
         return composerActions.enqueue(full)
       }
 
@@ -329,7 +335,10 @@ export function useSubmission(opts: UseSubmissionOptions) {
           // 'interrupt' / 'steer' should reach the live turn instead of
           // silently going back to the queue.  handleBusyInput resolves
           // mode-specific behavior (interrupt-and-send, steer, or queue).
-          if (getUiState().busyInputMode === 'queue') {
+          // 'queue' and 'integrated' both keep the edited item's position by
+          // putting it back at the front of the queue.
+          const _busyMode = getUiState().busyInputMode
+          if (_busyMode === 'queue' || _busyMode === 'integrated') {
             composerRefs.queueRef.current.unshift(picked)
 
             return composerActions.syncQueue()

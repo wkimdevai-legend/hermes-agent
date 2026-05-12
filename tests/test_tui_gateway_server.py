@@ -1309,6 +1309,41 @@ def test_config_busy_get_and_set(monkeypatch):
     assert ("display.busy_input_mode", "interrupt") in writes
 
 
+def test_config_busy_accepts_integrated(monkeypatch):
+    """`integrated` is a first-class busy mode: settable, persisted, and read back.
+
+    Regression: the TUI advertises `/busy integrated` and config.yaml may carry
+    `display.busy_input_mode: integrated`, but the gateway's `_load_busy_input_mode`
+    allowlist did not include it, so `config.get` silently reported `interrupt` —
+    which is exactly the surprising fallback the integrated mode exists to avoid.
+    """
+    cfg = {"display": {"busy_input_mode": "integrated"}}
+    writes = []
+    monkeypatch.setattr(server, "_load_cfg", lambda: cfg)
+    monkeypatch.setattr(
+        server, "_write_config_key", lambda path, value: writes.append((path, value))
+    )
+
+    # Loaded from config.yaml — must round-trip, not degrade to interrupt.
+    assert server._load_busy_input_mode() == "integrated"
+    get_resp = server.handle_request(
+        {"id": "1", "method": "config.get", "params": {"key": "busy"}}
+    )
+    assert get_resp["result"]["value"] == "integrated"
+
+    # And it is accepted by config.set (no "unknown busy mode" error).
+    set_resp = server.handle_request(
+        {
+            "id": "2",
+            "method": "config.set",
+            "params": {"key": "busy", "value": "integrated"},
+        }
+    )
+    assert "error" not in set_resp
+    assert set_resp["result"]["value"] == "integrated"
+    assert ("display.busy_input_mode", "integrated") in writes
+
+
 def test_config_set_yolo_process_scope_treats_false_like_env_as_disabled(monkeypatch):
     monkeypatch.setenv("HERMES_YOLO_MODE", "false")
 

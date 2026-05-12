@@ -28,7 +28,7 @@ export interface StateSetter<T> {
 
 export type StatusBarMode = 'bottom' | 'off' | 'top'
 
-export type BusyInputMode = 'interrupt' | 'queue' | 'steer'
+export type BusyInputMode = 'integrated' | 'interrupt' | 'queue' | 'steer'
 
 // Single source of truth for indicator style names.  Union type is
 // derived from this tuple so adding/removing a style only touches one
