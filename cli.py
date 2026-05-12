@@ -2182,14 +2182,21 @@ def _looks_like_slash_command(text: str) -> bool:
     return "/" not in first_word[1:]
 
 
-# Identity-only tag used to mark plain-text fragments captured while Hermes was
-# busy under ``display.busy_input_mode=integrated``.  Stored in
-# ``_pending_input`` as ``(_INTEGRATED_BUSY_PAYLOAD, text)`` so the drain step
-# can tell busy-time follow-ups apart from ordinary idle messages and only wrap
-# the former.  This must not be a string: image payloads are also two-tuples of
-# ``(caption, images)``, and a caption such as "integrated_busy" must remain a
-# normal image payload.
-_INTEGRATED_BUSY_PAYLOAD = object()
+# Structured pending-turn queue (orchestrator Phase 2).  ``cli.py`` keeps its
+# ``queue.Queue`` of legacy payloads but delegates the "what is a mergeable text
+# fragment / where is a boundary" logic to this leaf module so the rule lives in
+# one structured, serializable place that the gateway/TUI can adopt next.
+from agent import pending_turn_queue as _pending_turn_queue
+
+# Identity-only tag marking plain-text fragments captured while Hermes was busy
+# under ``display.busy_input_mode=integrated``.  Stored in ``_pending_input`` as
+# ``(_INTEGRATED_BUSY_PAYLOAD, text)`` so the drain step can tell busy-time
+# follow-ups apart from ordinary idle messages and only wrap the former.  Lives
+# in ``agent.pending_turn_queue`` (next to the structured representation that
+# understands it) and is re-exported here for the existing call sites.  It must
+# not be a string: image payloads are also two-tuples ``(caption, images)`` and
+# a caption such as "integrated_busy" must remain a normal image payload.
+_INTEGRATED_BUSY_PAYLOAD = _pending_turn_queue.INTEGRATED_BUSY_PAYLOAD
 
 
 # ============================================================================
@@ -8535,38 +8542,35 @@ class HermesCLI:
         once the current run finishes instead of processing them as separate
         turns.  Stop at slash commands or non-text payloads so explicit
         commands and image submissions keep their original ordering/semantics.
+
+        The "is this a mergeable text fragment / where is a boundary" rule is
+        delegated to :mod:`agent.pending_turn_queue`; only the ``queue.Queue``
+        plumbing (drain, re-queue the tail in order) stays here.
         """
-        if not isinstance(first_input, str) or _looks_like_slash_command(first_input):
+        ptq = _pending_turn_queue
+        if not ptq.legacy_cli_payload_is_coalescible_text(first_input):
             return first_input
 
         pending = getattr(self, "_pending_input", None)
         if pending is None:
             return first_input
 
-        parts = [first_input]
-        restore = []
+        drained = []
         while True:
             try:
-                item = pending.get_nowait()
+                drained.append(pending.get_nowait())
             except queue.Empty:
                 break
 
-            if isinstance(item, str) and item and not _looks_like_slash_command(item):
-                parts.append(item)
-                continue
+        turn_queue = ptq.PendingTurnQueue(
+            ptq.from_legacy_cli_payload(item, source=ptq.SOURCE_CLI) for item in drained
+        )
+        run = turn_queue.drain_coalescible_text_until_boundary(origin_busy=False)
+        # Restore everything past the first non-coalescible boundary, in order.
+        for leftover in turn_queue:
+            pending.put(ptq.maybe_to_legacy_cli_payload(leftover))
 
-            restore.append(item)
-            break
-
-        # Preserve any queued items after the first non-coalescible boundary.
-        while True:
-            try:
-                restore.append(pending.get_nowait())
-            except queue.Empty:
-                break
-        for item in restore:
-            pending.put(item)
-
+        parts = [first_input, *(item.text for item in run)]
         return "\n\n".join(parts) if len(parts) > 1 else first_input
 
     # ------------------------------------------------------------------
@@ -8589,11 +8593,7 @@ class HermesCLI:
     @staticmethod
     def _is_integrated_busy_payload(item) -> bool:
         """Return True if *item* is a tagged integrated busy-time fragment."""
-        return (
-            isinstance(item, tuple)
-            and len(item) == 2
-            and item[0] == _INTEGRATED_BUSY_PAYLOAD
-        )
+        return _pending_turn_queue.is_integrated_busy_payload(item)
 
     @staticmethod
     def _unwrap_integrated_busy_payload(item):
@@ -8624,49 +8624,35 @@ class HermesCLI:
         )
 
     def _coalesce_pending_integrated_busy_queue(self, first_text: str):
-        """Merge adjacent integrated busy-time text fragments into one string.
+        """Merge adjacent integrated busy-time text fragments onto *first_text*.
 
-        Only consecutive tagged plain-text fragments are joined (with
-        ``\\n\\n``).  The first non-text / slash-command / untagged item ends
-        the run and, together with everything after it, is restored to
-        ``_pending_input`` in its original order.
+        *first_text* is the already-unwrapped, validated leading fragment (a
+        non-empty, non-command string).  Only consecutive integrated-busy-tagged
+        plain-text fragments still queued are joined onto it (with ``\\n\\n``);
+        the first non-text / slash-command / untagged item ends the run and,
+        with everything after it, is restored to ``_pending_input`` in original
+        order.  The boundary rules live in :mod:`agent.pending_turn_queue`.
         """
         pending = getattr(self, "_pending_input", None)
         if pending is None:
             return first_text
 
-        parts = [first_text]
-        restore = []
+        ptq = _pending_turn_queue
+        drained = []
         while True:
             try:
-                item = pending.get_nowait()
+                drained.append(pending.get_nowait())
             except queue.Empty:
                 break
 
-            if HermesCLI._is_integrated_busy_payload(item):
-                unwrapped = HermesCLI._unwrap_integrated_busy_payload(item)
-                if (
-                    isinstance(unwrapped, str)
-                    and unwrapped
-                    and not _looks_like_slash_command(unwrapped)
-                ):
-                    parts.append(unwrapped)
-                    continue
-                restore.append(unwrapped)
-                break
+        turn_queue = ptq.PendingTurnQueue(
+            ptq.from_legacy_cli_payload(item, source=ptq.SOURCE_CLI) for item in drained
+        )
+        run = turn_queue.drain_coalescible_text_until_boundary(origin_busy=True)
+        for leftover in turn_queue:
+            pending.put(ptq.maybe_to_legacy_cli_payload(leftover))
 
-            restore.append(item)
-            break
-
-        # Preserve any queued items after the first non-coalescible boundary.
-        while True:
-            try:
-                restore.append(pending.get_nowait())
-            except queue.Empty:
-                break
-        for item in restore:
-            pending.put(item)
-
+        parts = [first_text, *(item.text for item in run)]
         return "\n\n".join(parts) if len(parts) > 1 else first_text
 
     def _prepare_pending_input_for_turn(self, first_input):

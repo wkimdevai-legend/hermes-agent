@@ -87,6 +87,18 @@ class TestIntegratedBusyMode(unittest.TestCase):
         self.assertFalse(cli_mod.HermesCLI._is_integrated_busy_payload(("text", ["/tmp/a.png"])))
         self.assertFalse(cli_mod.HermesCLI._is_integrated_busy_payload(("integrated_busy", ["/tmp/a.png"])))
 
+    def test_integrated_busy_payload_uses_identity_not_equality(self):
+        cli_mod = _import_cli()
+
+        class EqualitySpoof:
+            def __eq__(self, other):
+                return True
+
+        spoofed = (EqualitySpoof(), "not actually tagged")
+
+        self.assertFalse(cli_mod.HermesCLI._is_integrated_busy_payload(spoofed))
+        self.assertEqual(cli_mod.HermesCLI._unwrap_integrated_busy_payload(spoofed), spoofed)
+
     def test_busy_payload_for_mode_tags_text_in_integrated(self):
         cli_mod = _import_cli()
         stub = SimpleNamespace(busy_input_mode="integrated")
