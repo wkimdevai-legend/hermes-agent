@@ -1,6 +1,8 @@
 """Tests for coalescing queued busy-mode CLI messages."""
 
 import queue
+import threading
+import time
 import unittest
 from types import SimpleNamespace
 
@@ -65,6 +67,51 @@ class TestBusyQueueCoalescing(unittest.TestCase):
 
         self.assertEqual(combined, "/busy")
         self.assertEqual(stub._pending_input.get_nowait(), "뒤의 메시지")
+
+    def test_drain_requeue_keeps_boundary_ahead_of_concurrent_producer(self):
+        cli_mod = _import_cli()
+
+        class HookedQueue(queue.Queue):
+            def __init__(self):
+                super().__init__()
+                self.hook = None
+
+            def put(self, item, *args, **kwargs):
+                if self.hook is not None:
+                    hook = self.hook
+                    self.hook = None
+                    hook()
+                return super().put(item, *args, **kwargs)
+
+        pending = HookedQueue()
+        for item in ["이렇게", "/busy status", "다음"]:
+            pending.put(item)
+        stub = SimpleNamespace(_pending_input=pending, _pending_input_lock=threading.RLock())
+        stub._put_pending_input = cli_mod.HermesCLI._put_pending_input.__get__(stub, type(stub))
+
+        producer_done = threading.Event()
+
+        def concurrent_producer():
+            thread = threading.Thread(
+                target=lambda: (stub._put_pending_input("새 입력"), producer_done.set()),
+                daemon=True,
+            )
+            thread.start()
+            # If coalesce/requeue does not hold the same lock as producers, the
+            # producer can slip into the queue before the slash-command boundary
+            # is restored. Holding the lock forces it to wait until all leftovers
+            # are back in original order.
+            time.sleep(0.05)
+
+        pending.hook = concurrent_producer
+
+        combined = cli_mod.HermesCLI._coalesce_pending_busy_queue(stub, "왜")
+
+        self.assertEqual(combined, "왜\n\n이렇게")
+        self.assertTrue(producer_done.wait(1.0))
+        self.assertEqual(pending.get_nowait(), "/busy status")
+        self.assertEqual(pending.get_nowait(), "다음")
+        self.assertEqual(pending.get_nowait(), "새 입력")
 
 
 class TestIntegratedBusyMode(unittest.TestCase):

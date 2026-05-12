@@ -572,6 +572,28 @@ class TestPluginContext:
 
         from tools.registry import registry
         assert "plugin_echo" in registry._tools
+    def test_inject_message_idle_uses_cli_pending_input_helper(self):
+        """Idle plugin injection participates in CLI pending-input ordering lock."""
+        mgr = PluginManager()
+        manifest = PluginManifest(name="test-plugin", source="user")
+        ctx = PluginContext(manifest, mgr)
+
+        class DummyCLI:
+            _agent_running = False
+
+            def __init__(self):
+                self._pending_input = MagicMock()
+                self.helper_calls = []
+
+            def _put_pending_input(self, msg):
+                self.helper_calls.append(msg)
+
+        cli = DummyCLI()
+        mgr._cli_ref = cli
+
+        assert ctx.inject_message("hello") is True
+        assert cli.helper_calls == ["hello"]
+        cli._pending_input.put.assert_not_called()
 
 
 # ── TestPluginToolVisibility ───────────────────────────────────────────────

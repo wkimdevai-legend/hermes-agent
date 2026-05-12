@@ -39,7 +39,7 @@ import uuid
 import textwrap
 from collections import deque
 from urllib.parse import unquote, urlparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from datetime import datetime
 from typing import List, Dict, Any, Optional
@@ -2614,6 +2614,10 @@ class HermesCLI:
         # mode does not go through run().
         self._agent_running = False
         self._pending_input = queue.Queue()
+        # Guard compound pending-input operations (drain + requeue) so a
+        # producer cannot insert a fresh item between restoring boundary
+        # leftovers and accidentally reorder user follow-ups.
+        self._pending_input_lock = threading.RLock()
         self._interrupt_queue = queue.Queue()
         # Tracks whether the turn that just finished was interrupted via
         # Ctrl+C. Consumed by _maybe_continue_goal_after_turn so /goal loops
@@ -7509,7 +7513,7 @@ class HermesCLI:
             retry_msg = self.retry_last()
             if retry_msg and hasattr(self, '_pending_input'):
                 # Re-queue the message so process_loop sends it to the agent
-                self._pending_input.put(retry_msg)
+                self._put_pending_input(retry_msg)
         elif canonical == "undo":
             if self._confirm_destructive_slash(
                 "undo",
@@ -7615,7 +7619,7 @@ class HermesCLI:
             if not payload:
                 _cprint("  Usage: /queue <prompt>")
             else:
-                self._pending_input.put(payload)
+                self._put_pending_input(payload)
                 if self._agent_running:
                     _cprint(f"  Queued for the next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
                 else:
@@ -7642,7 +7646,7 @@ class HermesCLI:
                         _cprint("  Steer rejected (empty payload).")
             else:
                 # No active run — treat as a normal next-turn message.
-                self._pending_input.put(payload)
+                self._put_pending_input(payload)
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
@@ -7716,7 +7720,7 @@ class HermesCLI:
                     skill_name = _skill_commands[base_cmd]["name"]
                     print(f"\n⚡ Loading skill: {skill_name}")
                     if hasattr(self, '_pending_input'):
-                        self._pending_input.put(msg)
+                        self._put_pending_input(msg)
                 else:
                     ChatConsole().print(f"[bold red]Failed to load skill for {base_cmd}[/]")
             else:
@@ -8048,7 +8052,7 @@ class HermesCLI:
 
             # Inject context message so the model knows
             if hasattr(self, '_pending_input'):
-                self._pending_input.put(
+                self._put_pending_input(
                     "[System note: The user has connected your browser tools to their live Chrome browser "
                     "via Chrome DevTools Protocol. Your browser_navigate, browser_snapshot, browser_click, "
                     "and other browser tools now control their real browser — including any pages they have "
@@ -8073,7 +8077,7 @@ class HermesCLI:
                 print()
 
                 if hasattr(self, '_pending_input'):
-                    self._pending_input.put(
+                    self._put_pending_input(
                         "[System note: The user has disconnected the browser tools from their live Chrome. "
                         "Browser tools are back to default mode (headless local browser or cloud provider).]"
                     )
@@ -8238,7 +8242,7 @@ class HermesCLI:
         # Kick the loop off immediately so the user doesn't have to send a
         # separate message after setting the goal.
         try:
-            self._pending_input.put(state.goal)
+            self._put_pending_input(state.goal)
         except Exception:
             pass
 
@@ -8328,7 +8332,7 @@ class HermesCLI:
             prompt = decision.get("continuation_prompt")
             if prompt:
                 try:
-                    self._pending_input.put(prompt)
+                    self._put_pending_input(prompt)
                 except Exception as exc:
                     logging.debug("goal continuation enqueue failed: %s", exc)
 
@@ -8533,6 +8537,18 @@ class HermesCLI:
         else:
             _cprint(f"  {_ACCENT}✓ Reasoning effort set to '{arg}' (session only){_RST}")
 
+    def _put_pending_input(self, item):
+        """Append to the CLI pending-input queue under the queue-order lock."""
+        pending = getattr(self, "_pending_input", None)
+        if pending is None:
+            return
+        lock = getattr(self, "_pending_input_lock", None)
+        if lock is None:
+            pending.put(item)
+            return
+        with lock:
+            pending.put(item)
+
     def _coalesce_pending_busy_queue(self, first_input):
         """Merge consecutive queued plain-text busy inputs into one next turn.
 
@@ -8555,20 +8571,27 @@ class HermesCLI:
         if pending is None:
             return first_input
 
-        drained = []
-        while True:
-            try:
-                drained.append(pending.get_nowait())
-            except queue.Empty:
-                break
+        lock = getattr(self, "_pending_input_lock", None)
+        if lock is None:
+            lock_cm = nullcontext()
+        else:
+            lock_cm = lock
 
-        turn_queue = ptq.PendingTurnQueue(
-            ptq.from_legacy_cli_payload(item, source=ptq.SOURCE_CLI) for item in drained
-        )
-        run = turn_queue.drain_coalescible_text_until_boundary(origin_busy=False)
-        # Restore everything past the first non-coalescible boundary, in order.
-        for leftover in turn_queue:
-            pending.put(ptq.maybe_to_legacy_cli_payload(leftover))
+        with lock_cm:
+            drained = []
+            while True:
+                try:
+                    drained.append(pending.get_nowait())
+                except queue.Empty:
+                    break
+
+            turn_queue = ptq.PendingTurnQueue(
+                ptq.from_legacy_cli_payload(item, source=ptq.SOURCE_CLI) for item in drained
+            )
+            run = turn_queue.drain_coalescible_text_until_boundary(origin_busy=False)
+            # Restore everything past the first non-coalescible boundary, in order.
+            for leftover in turn_queue:
+                pending.put(ptq.maybe_to_legacy_cli_payload(leftover))
 
         parts = [first_input, *(item.text for item in run)]
         return "\n\n".join(parts) if len(parts) > 1 else first_input
@@ -8638,19 +8661,26 @@ class HermesCLI:
             return first_text
 
         ptq = _pending_turn_queue
-        drained = []
-        while True:
-            try:
-                drained.append(pending.get_nowait())
-            except queue.Empty:
-                break
+        lock = getattr(self, "_pending_input_lock", None)
+        if lock is None:
+            lock_cm = nullcontext()
+        else:
+            lock_cm = lock
 
-        turn_queue = ptq.PendingTurnQueue(
-            ptq.from_legacy_cli_payload(item, source=ptq.SOURCE_CLI) for item in drained
-        )
-        run = turn_queue.drain_coalescible_text_until_boundary(origin_busy=True)
-        for leftover in turn_queue:
-            pending.put(ptq.maybe_to_legacy_cli_payload(leftover))
+        with lock_cm:
+            drained = []
+            while True:
+                try:
+                    drained.append(pending.get_nowait())
+                except queue.Empty:
+                    break
+
+            turn_queue = ptq.PendingTurnQueue(
+                ptq.from_legacy_cli_payload(item, source=ptq.SOURCE_CLI) for item in drained
+            )
+            run = turn_queue.drain_coalescible_text_until_boundary(origin_busy=True)
+            for leftover in turn_queue:
+                pending.put(ptq.maybe_to_legacy_cli_payload(leftover))
 
         parts = [first_text, *(item.text for item in run)]
         return "\n\n".join(parts) if len(parts) > 1 else first_text
@@ -9707,7 +9737,7 @@ class HermesCLI:
                 self._attached_images.clear()
                 if hasattr(self, '_app') and self._app:
                     self._app.invalidate()
-                self._pending_input.put(transcript)
+                self._put_pending_input(transcript)
                 submitted = True
             elif result.get("success"):
                 _cprint(f"{_DIM}No speech detected.{_RST}")
@@ -10993,7 +11023,7 @@ class HermesCLI:
                     print(f"\n⚡ Sending {n} messages after interrupt: '{preview}'")
                 else:
                     print(f"\n⚡ Sending after interrupt: '{preview}'")
-                self._pending_input.put(combined)
+                self._put_pending_input(combined)
 
             # If a /steer was left over (agent finished before another tool
             # batch could absorb it), deliver it as the next user turn.
@@ -11001,7 +11031,7 @@ class HermesCLI:
             if _leftover_steer and hasattr(self, '_pending_input'):
                 preview = _leftover_steer[:60] + ("..." if len(_leftover_steer) > 60 else "")
                 print(f"\n⏩ Delivering leftover /steer as next turn: '{preview}'")
-                self._pending_input.put(_leftover_steer)
+                self._put_pending_input(_leftover_steer)
 
             return response
             
@@ -11612,7 +11642,7 @@ class HermesCLI:
                         if _effective_mode == "integrated" and text and not images:
                             queued_payload = self._make_integrated_busy_payload(text)
                             _tagged_integrated = True
-                        self._pending_input.put(queued_payload)
+                        self._put_pending_input(queued_payload)
                         preview = text if text else f"[{len(images)} image{'s' if len(images) != 1 else ''} attached]"
                         if _tagged_integrated:
                             _cprint(f"  Will integrate after the current turn: {preview[:80]}{'...' if len(preview) > 80 else ''}")
@@ -11647,7 +11677,7 @@ class HermesCLI:
                     except Exception:
                         pass
                 else:
-                    self._pending_input.put(payload)
+                    self._put_pending_input(payload)
                 event.app.current_buffer.reset(append_to_history=True)
 
         _bind_prompt_submit_keys(kb, handle_enter)
@@ -13161,7 +13191,7 @@ class HermesCLI:
                                     else:
                                         _synth = _format_process_notification(evt)
                                         if _synth:
-                                            self._pending_input.put(_synth)
+                                            self._put_pending_input(_synth)
                             except Exception:
                                 pass
                         continue
@@ -13275,7 +13305,7 @@ class HermesCLI:
                                     continue  # already delivered via tool result
                                 _synth = _format_process_notification(evt)
                                 if _synth:
-                                    self._pending_input.put(_synth)
+                                    self._put_pending_input(_synth)
                         except Exception:
                             pass  # Non-fatal — don't break the main loop
 

@@ -367,8 +367,14 @@ class PluginContext:
             # Agent is mid-turn — interrupt with the message
             cli._interrupt_queue.put(msg)
         else:
-            # Agent is idle — queue as next input
-            cli._pending_input.put(msg)
+            # Agent is idle — queue as next input. Prefer the CLI helper so
+            # plugin-injected messages participate in the same pending-input
+            # ordering lock as UI/voice/process producers.
+            put_pending = getattr(cli, "_put_pending_input", None)
+            if callable(put_pending):
+                put_pending(msg)
+            else:
+                cli._pending_input.put(msg)
         return True
 
     # -- CLI command registration --------------------------------------------
