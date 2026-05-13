@@ -44,14 +44,6 @@ def busy_input_hint_gateway(mode: str) -> str:
             "Send `/busy interrupt` to make new messages stop the current task "
             "immediately, or `/busy status` to check. This notice won't appear again."
         )
-    if mode == "integrated":
-        return (
-            "💡 First-time tip — I queued your message instead of interrupting. "
-            "In gateway mode, `/busy integrated` currently falls back to queue-like "
-            "behavior until structured follow-up routing is available. Send "
-            "`/busy interrupt` or `/busy status` to change/check this. This notice "
-            "won't appear again."
-        )
     if mode == "steer":
         return (
             "💡 First-time tip — I steered your message into the current run; "
@@ -74,13 +66,6 @@ def busy_input_hint_cli(mode: str) -> str:
             "(tip) Your message was queued for the next turn. "
             "Use /busy interrupt to make Enter stop the current run instead, "
             "or /busy steer to inject mid-run. This tip only shows once."
-        )
-    if mode == "integrated":
-        return (
-            "(tip) Your message was collected to integrate after the current "
-            "run. Fragments you send while busy are bundled into one follow-up. "
-            "Use /busy interrupt or /busy queue to change this. This tip only "
-            "shows once."
         )
     if mode == "steer":
         return (

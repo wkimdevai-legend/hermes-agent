@@ -20,8 +20,6 @@ import { isRemoteShellSession } from '../lib/terminalSetup.js'
 import { pasteTokenLabel, stripTrailingPasteNewlines } from '../lib/text.js'
 
 import type { MaybePromise, PasteSnippet, UseComposerStateOptions, UseComposerStateResult } from './interfaces.js'
-import { looksLikeDroppedPath } from './dropPath.js'
-export { looksLikeDroppedPath } from './dropPath.js'
 import { $isBlocked } from './overlayStore.js'
 import { getUiState } from './uiStore.js'
 
@@ -57,6 +55,47 @@ function insertAtCursor(value: string, cursor: number, text: string): { cursor: 
     cursor: cursor + insert.length,
     value: value.slice(0, cursor) + insert + value.slice(cursor)
   }
+}
+
+/**
+ * Quick client-side heuristic to detect text that looks like a dropped file path.
+ * When this returns true the composer sends RPC calls to the server for actual
+ * validation. Keep in sync with _detect_file_drop() in cli.py — see that
+ * function for the canonical prefix list.
+ */
+export function looksLikeDroppedPath(text: string): boolean {
+  const trimmed = text.trim()
+
+  if (!trimmed || trimmed.includes('\n')) {
+    return false
+  }
+
+  // file:// URIs, relative, home-relative, quoted, and Windows drive paths
+  if (
+    trimmed.startsWith('file://') ||
+    trimmed.startsWith('~/') ||
+    trimmed.startsWith('./') ||
+    trimmed.startsWith('../') ||
+    trimmed.startsWith('"/') ||
+    trimmed.startsWith("'/") ||
+    trimmed.startsWith('"~') ||
+    trimmed.startsWith("'~") ||
+    /^[A-Za-z]:[/\\]/.test(trimmed) ||
+    /^["'][A-Za-z]:[/\\]/.test(trimmed)
+  ) {
+    return true
+  }
+
+  // Bare absolute paths (start with /) — require a second '/' or a '.' to avoid
+  // false positives on short strings like "/api" or "/help" which would trigger
+  // unnecessary RPC round-trips.
+  if (trimmed.startsWith('/')) {
+    const rest = trimmed.slice(1)
+
+    return rest.includes('/') || rest.includes('.')
+  }
+
+  return false
 }
 
 export function useComposerState({

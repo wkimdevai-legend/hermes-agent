@@ -120,12 +120,6 @@ class TestHintMessages:
         assert "/busy interrupt" in msg
         assert "queued" in msg.lower()
 
-    def test_busy_input_hint_gateway_integrated(self):
-        msg = busy_input_hint_gateway("integrated")
-        assert "/busy integrated" in msg
-        assert "/busy interrupt" in msg
-        assert "queue" in msg.lower()
-
     def test_busy_input_hint_gateway_steer(self):
         msg = busy_input_hint_gateway("steer")
         assert "/busy interrupt" in msg
@@ -153,7 +147,6 @@ class TestHintMessages:
     def test_hints_are_not_empty(self):
         for hint in (
             busy_input_hint_gateway("queue"),
-            busy_input_hint_gateway("integrated"),
             busy_input_hint_gateway("interrupt"),
             busy_input_hint_gateway("steer"),
             busy_input_hint_cli("queue"),

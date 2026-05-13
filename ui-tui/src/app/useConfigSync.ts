@@ -34,7 +34,7 @@ const STATUSBAR_ALIAS: Record<string, StatusBarMode> = {
 export const normalizeStatusBar = (raw: unknown): StatusBarMode =>
   raw === false ? 'off' : typeof raw === 'string' ? (STATUSBAR_ALIAS[raw.trim().toLowerCase()] ?? 'top') : 'top'
 
-const BUSY_MODES = new Set<BusyInputMode>(['integrated', 'interrupt', 'queue', 'steer'])
+const BUSY_MODES = new Set<BusyInputMode>(['interrupt', 'queue', 'steer'])
 
 // TUI defaults to `queue` even though the framework default
 // (`hermes_cli/config.py`) is `interrupt`.  Rationale: in a full-screen

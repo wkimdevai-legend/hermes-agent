@@ -198,14 +198,12 @@ describe('normalizeMouseTracking', () => {
 describe('normalizeBusyInputMode', () => {
   it('passes through the canonical CLI parity values', () => {
     expect(normalizeBusyInputMode('queue')).toBe('queue')
-    expect(normalizeBusyInputMode('integrated')).toBe('integrated')
     expect(normalizeBusyInputMode('steer')).toBe('steer')
     expect(normalizeBusyInputMode('interrupt')).toBe('interrupt')
   })
 
   it('trims and lowercases input', () => {
     expect(normalizeBusyInputMode(' Queue ')).toBe('queue')
-    expect(normalizeBusyInputMode(' Integrated ')).toBe('integrated')
     expect(normalizeBusyInputMode('STEER')).toBe('steer')
   })
 
@@ -255,9 +253,6 @@ describe('applyDisplay → busy_input_mode', () => {
 
     applyDisplay({ config: { display: { busy_input_mode: 'queue' } } }, setBell)
     expect($uiState.get().busyInputMode).toBe('queue')
-
-    applyDisplay({ config: { display: { busy_input_mode: 'integrated' } } }, setBell)
-    expect($uiState.get().busyInputMode).toBe('integrated')
 
     applyDisplay({ config: { display: { busy_input_mode: 'steer' } } }, setBell)
     expect($uiState.get().busyInputMode).toBe('steer')
