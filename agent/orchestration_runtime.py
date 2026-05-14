@@ -30,30 +30,28 @@ What this module is -- and isn't:
   :data:`RUNTIME_ATTR`; "create if absent" attaches a fresh empty runtime so an
   observability surface always has *something* truthful to read (an empty board),
   never a fabricated one.
-* It is **not** the Ralph / focused-agent runtime, **not** a worker-dispatch or
-  ``delegate_task(background=True)`` mechanism (it starts, polls, kills no
-  workers -- a future phase that wants a lane calls
-  ``runtime.worker_registry.register(lane)`` itself), **not** a follow-up
-  classifier or natural-language router (that is :mod:`agent.followup_router`),
-  **not** automatic Telegram/gateway routing of status queries, **not** a
-  cancel/stop/force-kill surface, **not** a durable routing DB / SQLite schema,
-  **not** an LLM classifier, and **not** a global singleton -- there is no
-  module-level registry; every runtime lives on the object that owns it.  It also
-  does **not** register or rewire the existing ``/tasks`` / ``/agents`` slash
-  commands here: those names are already taken by an unrelated background-process
-  / subagent listing in ``cli.py`` and ``gateway/run.py``, so repurposing them --
-  or threading a runtime through that dispatch -- is exactly the broad
-  CLI/gateway refactor this phase stops short of; the helpers below are what a
-  later, focused command-wiring phase will build on.  See the Phase 7 notes doc.
+* It now includes the first *library-level* frontdesk loop:
+  :meth:`OrchestrationRuntime.handle_frontdesk_input` consumes the Phase 2
+  control-plane verdict and performs the minimal injected-registry side effects
+  needed for STOP / STATUS / STEER / WORKER.  This loop is still not live
+  CLI/Gateway wiring and still starts only lanes that a caller explicitly
+  registered on the runtime.
+* It is **not** the Ralph / focused-agent runtime, **not** a
+  ``delegate_task(background=True)`` mechanism, **not** automatic
+  Telegram/gateway routing of arbitrary natural-language messages, **not** a
+  durable routing DB / SQLite schema, **not** an LLM classifier, and **not** a
+  global singleton -- there is no module-level registry; every runtime lives on
+  the object that owns it.  It also does **not** register or rewire the existing
+  ``/tasks`` / ``/agents`` slash commands here: those names are already taken by
+  an unrelated background-process / subagent listing in ``cli.py`` and
+  ``gateway/run.py``, so repurposing them -- or threading a runtime through that
+  dispatch -- remains a focused command-wiring phase.
 
 Scope discipline (mirrors the Phase 2-6 leaf/presentation modules):
 
-* This module is read-only with respect to user/task state: it never mutates a
-  task, a worker, a queue, or a follow-up.  It only *holds* the registries and
-  *reads* them via the Phase 6 formatter, which itself counts
-  ``pending_followups`` (``len(...)``) and never iterates their payloads -- so
-  :attr:`~agent.pending_turn_queue.PendingTurnItem.raw` is never serialised,
-  copied, deep-copied, or otherwise touched anywhere on this path.
+* Status/advisory helpers remain read-only: they never mutate a task, a worker,
+  a queue, or a follow-up.  The explicit frontdesk loop is the only mutating
+  path in this module, and it mutates only the injected task/worker registries.
 * Everything :meth:`OrchestrationRuntime.snapshot` returns is the Phase 6
   :class:`~agent.orchestration_status.OrchestrationSnapshot`, whose ``to_dict``
   is plain JSON-safe data (strings, ints, ``None``, lists/dicts of those).
@@ -68,10 +66,12 @@ Scope discipline (mirrors the Phase 2-6 leaf/presentation modules):
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 from agent.control_plane import (
     ControlPlaneDecision,
+    Intent,
+    Recommendation,
     classify as _classify_frontdesk,
 )
 from agent.orchestration_status import (
@@ -81,11 +81,21 @@ from agent.orchestration_status import (
     format_overview as _format_overview,
     format_tasks as _format_tasks,
 )
-from agent.task_registry import TaskRegistry
-from agent.worker_lanes import WorkerLaneRegistry
+from agent.task_registry import (
+    STATUS_CANCELLED,
+    STATUS_QUEUED,
+    STATUS_RUNNING,
+    TaskRegistry,
+)
+from agent.worker_lanes import (
+    WorkerLaneRegistry,
+    WorkerSpec,
+    link_worker_to_task,
+)
 
 __all__ = [
     "RUNTIME_ATTR",
+    "FrontdeskTurnResult",
     "OrchestrationRuntime",
     "get_orchestration_runtime",
     "get_or_create_orchestration_runtime",
@@ -100,6 +110,37 @@ __all__ = [
 # place so every helper agrees; underscore-prefixed so it reads as internal state
 # on whatever ``HermesCLI`` / gateway runner / session it lands on.
 RUNTIME_ATTR = "_orchestration_runtime"
+
+
+@dataclass(frozen=True, slots=True)
+class FrontdeskTurnResult:
+    """Result of the minimal frontdesk control loop for one input fragment.
+
+    ``action`` is deliberately a small string vocabulary rather than an enum so
+    adapters can render it without importing another type.  The runtime returns
+    this object instead of raising for ordinary routing outcomes; caller-visible
+    errors (for example, no worker lane registered) are represented as a control
+    message and a task note.
+    """
+
+    decision: ControlPlaneDecision
+    action: str
+    message: str
+    task_id: str | None = None
+    worker_id: str | None = None
+    cancelled_tasks: int = 0
+    cancelled_workers: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decision": self.decision.to_dict(),
+            "action": self.action,
+            "message": self.message,
+            "task_id": self.task_id,
+            "worker_id": self.worker_id,
+            "cancelled_tasks": self.cancelled_tasks,
+            "cancelled_workers": self.cancelled_workers,
+        }
 
 
 # --------------------------------------------------------------------------
@@ -172,6 +213,163 @@ class OrchestrationRuntime:
         return _classify_frontdesk(
             request_text, frontdesk_mode_active=frontdesk_mode_active
         )
+
+    # -- minimal frontdesk control loop ----------------------------------
+    def handle_frontdesk_input(
+        self,
+        request_text: str,
+        *,
+        frontdesk_mode_active: bool = False,
+        session_key: str | None = None,
+        source_surface: str = "cli",
+        main_in_flight: bool = False,
+        steer_callback: Callable[[str], Any] | None = None,
+    ) -> FrontdeskTurnResult:
+        """Route one input fragment through the first functional frontdesk loop.
+
+        This is intentionally still a *library* loop, not live CLI/Gateway
+        wiring.  It consumes the Phase 2 control-plane decision and performs the
+        smallest safe side effects on the injected registries:
+
+        * STOP cancels active tasks/workers for the session and returns a local
+          control line; the stopped text is never converted into a follow-up.
+        * STATUS returns the local runtime overview.
+        * STEER calls an explicit ``steer_callback`` only when the caller says a
+          main turn is in flight; otherwise it falls back to ``MAIN``.
+        * NEW_TASK_WORKER creates a focused task, starts a registered worker lane,
+          and links task <-> worker.  If no lane is registered, the task is
+          cancelled with a local control message instead of fabricating work.
+        """
+        decision = self.advise_frontdesk(
+            request_text, frontdesk_mode_active=frontdesk_mode_active
+        )
+
+        if decision.intent is Intent.STOP:
+            cancelled_tasks, cancelled_workers = self._cancel_active_frontdesk_work(
+                session_key=session_key
+            )
+            return FrontdeskTurnResult(
+                decision=decision,
+                action="stopped",
+                message=(
+                    f"control: stopped {cancelled_tasks} task(s), "
+                    f"{cancelled_workers} worker(s)"
+                ),
+                cancelled_tasks=cancelled_tasks,
+                cancelled_workers=cancelled_workers,
+            )
+
+        if decision.intent is Intent.STATUS:
+            return FrontdeskTurnResult(
+                decision=decision,
+                action="status",
+                message=self.format_overview(session_key=session_key),
+            )
+
+        if decision.intent is Intent.STEER:
+            if main_in_flight and steer_callback is not None:
+                steer_callback(decision.raw_text)
+                return FrontdeskTurnResult(
+                    decision=decision,
+                    action="steered",
+                    message="control: steered active main turn",
+                )
+            return FrontdeskTurnResult(
+                decision=decision,
+                action="main",
+                message="control: no active main turn to steer; route as main input",
+            )
+
+        if decision.intent is Intent.NEW_TASK_WORKER:
+            return self._start_worker_task(
+                decision,
+                session_key=session_key,
+                source_surface=source_surface,
+            )
+
+        if decision.recommendation is Recommendation.CONTROL:
+            return FrontdeskTurnResult(
+                decision=decision,
+                action=decision.intent.value,
+                message=f"control: {decision.intent.value}",
+            )
+
+        return FrontdeskTurnResult(
+            decision=decision,
+            action="main",
+            message="route: main",
+        )
+
+    def _start_worker_task(
+        self,
+        decision: ControlPlaneDecision,
+        *,
+        session_key: str | None,
+        source_surface: str,
+    ) -> FrontdeskTurnResult:
+        task = self.task_registry.create_task(
+            decision.raw_text,
+            session_key=session_key,
+            origin={"platform": source_surface, "session_key": session_key},
+            status=STATUS_QUEUED,
+        )
+        lane_names = self.worker_registry.lane_names()
+        if not lane_names:
+            self.task_registry.update_status(
+                task.task_id,
+                STATUS_CANCELLED,
+                note="frontdesk worker requested but no worker lane is registered",
+            )
+            return FrontdeskTurnResult(
+                decision=decision,
+                action="worker_unavailable",
+                message="control: worker lane unavailable",
+                task_id=task.task_id,
+            )
+
+        lane_name = lane_names[0]
+        spec = WorkerSpec(
+            goal=decision.raw_text,
+            task_id=task.task_id,
+            lane=lane_name,
+            metadata={
+                "frontdesk_fingerprint": decision.fingerprint,
+                "source_surface": source_surface,
+            },
+        )
+        handle = self.worker_registry.start(spec)
+        link_worker_to_task(self.task_registry, task.task_id, handle)
+        self.task_registry.update_status(
+            task.task_id,
+            STATUS_RUNNING,
+            note=f"worker started: {handle.worker_id}",
+        )
+        return FrontdeskTurnResult(
+            decision=decision,
+            action="worker_started",
+            message=f"control: worker started {handle.worker_id}",
+            task_id=task.task_id,
+            worker_id=handle.worker_id,
+        )
+
+    def _cancel_active_frontdesk_work(
+        self, *, session_key: str | None = None
+    ) -> tuple[int, int]:
+        cancelled_workers = 0
+        for worker in self.snapshot(session_key=session_key).workers:
+            if worker.get("status") in {"queued", "running"}:
+                worker_id = worker.get("worker_id")
+                if isinstance(worker_id, str) and self.worker_registry.cancel(worker_id):
+                    cancelled_workers += 1
+
+        cancelled_tasks = 0
+        for task in self.task_registry.list_tasks(
+            session_key=session_key, active_only=True
+        ):
+            if task.status != STATUS_CANCELLED:
+                self.task_registry.cancel_task(task.task_id, reason="frontdesk stop")
+                cancelled_tasks += 1
+        return cancelled_tasks, cancelled_workers
 
 
 # --------------------------------------------------------------------------
